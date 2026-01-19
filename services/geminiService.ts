@@ -256,9 +256,9 @@ export const generateLifeAnalysis = async (input: UserInput): Promise<LifeDestin
     1) 返回内容必须是一个合法的 JSON 对象，不要在 JSON 之外输出任何解释性文本。
     2) 为了便于程序抽取，请把 JSON 用下面的标记包裹（并只在这两个标记之间输出 JSON）：
        ###JSON_START###
-       ```json
+       ${'```json'}
        { ... }
-       ```
+       ${'```'}
        ###JSON_END###
     3) JSON 中字段请严格按照 system instruction 中的结构返回（包含 chartData/chartPoints 与 analysis）。
     4) 尽量不要使用单引号作为字符串边界；使用双引号。
