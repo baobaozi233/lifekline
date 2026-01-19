@@ -4,7 +4,7 @@ import { BAZI_SYSTEM_INSTRUCTION } from "../constants";
 /**
  * 注意：
  * - 本实现从 Vite 的环境变量读取 API Key（VITE_OPENAI_KEY），并直接在浏览器端调用 OpenAI。
- * - 这会把 key 打包到客户端，存在泄露风险。生产环境强烈建议使用后端中转（Vercel Serverless / API 路由）来保存与使用秘钥。
+ * - 生产环境请尽量改为后端中转以保护密钥并在服务器端做解析与重试。
  */
 
 // Vite 注入的环境变量（若未设置则为空字符串）
@@ -34,10 +34,181 @@ const validateLifeDestinyData = (data: any): boolean => {
   return true;
 };
 
+/**
+ * Try to find the first balanced JSON object or array in a string.
+ * This function handles string delimiters and escapes to avoid cutting inside strings.
+ */
+function findBalancedJSON(s: string): string | null {
+  if (!s) return null;
+  const startIdx = (() => {
+    const idxObj = s.indexOf('{');
+    const idxArr = s.indexOf('[');
+    if (idxObj === -1) return idxArr;
+    if (idxArr === -1) return idxObj;
+    return Math.min(idxObj, idxArr);
+  })();
+  if (startIdx === -1) return null;
+
+  const stack: string[] = [];
+  let inString = false;
+  let stringChar = '';
+  let escaped = false;
+
+  for (let i = startIdx; i < s.length; i++) {
+    const ch = s[i];
+
+    if (inString) {
+      if (escaped) {
+        escaped = false;
+        continue;
+      }
+      if (ch === '\\') {
+        escaped = true;
+        continue;
+      }
+      if (ch === stringChar) {
+        inString = false;
+        stringChar = '';
+      }
+      continue;
+    } else {
+      if (ch === '"' || ch === "'") {
+        inString = true;
+        stringChar = ch;
+        continue;
+      }
+      if (ch === '{' || ch === '[') {
+        stack.push(ch);
+      } else if (ch === '}' || ch === ']') {
+        const last = stack.pop();
+        // basic matching; if mismatch, still continue
+        if (!last) {
+          // unmatched closing; skip
+        }
+        if (stack.length === 0) {
+          // found balanced JSON from startIdx .. i
+          return s.slice(startIdx, i + 1);
+        }
+      }
+    }
+  }
+  // no balanced block found
+  return null;
+}
+
+/**
+ * Remove trailing commas before } or ] which commonly cause JSON.parse errors.
+ * e.g. {"a":1,}  or [1,2,]
+ */
+function removeTrailingCommas(jsonLike: string): string {
+  // remove trailing commas in objects/arrays
+  return jsonLike
+    .replace(/,\s*}/g, '}')
+    .replace(/,\s*]/g, ']');
+}
+
+/**
+ * Some other small repairs: convert single quotes used as string delimiters to double quotes,
+ * but only when safe-ish: not when there's already double quotes. This is heuristic and optional.
+ */
+function singleQuotesToDouble(jsonLike: string): string {
+  // naive: only replace single-quoted strings that don't contain double quotes
+  // This is risky; keep conservative: replace patterns like 'text' => "text"
+  return jsonLike.replace(/'([^'\\]*(\\.[^'\\]*)*)'/g, (_m, g1) => {
+    // escape any double quotes inside captured group
+    const fixed = g1.replace(/"/g, '\\"');
+    return `"${fixed}"`;
+  });
+}
+
+/**
+ * Try multiple strategies to parse the model output into JSON.
+ */
+function safeParseModelJson(content: string): any {
+  // 1. direct parse
+  try {
+    return JSON.parse(content);
+  } catch (e) {
+    // continue to extraction/repair
+  }
+
+  // 2. extract between explicit markers if present
+  const startMarker = "###JSON_START###";
+  const endMarker = "###JSON_END###";
+  if (content.includes(startMarker) && content.includes(endMarker)) {
+    const between = content.split(startMarker)[1]?.split(endMarker)[0];
+    if (between) {
+      const cleaned = removeTrailingCommas(between.trim());
+      try {
+        return JSON.parse(cleaned);
+      } catch (_e) {
+        // fall through to next attempts
+      }
+    }
+  }
+
+  // 3. try to find first balanced JSON block
+  const block = findBalancedJSON(content);
+  if (block) {
+    // attempt repairs
+    let attempt = block;
+    // remove common trailing commas
+    attempt = removeTrailingCommas(attempt);
+    try {
+      return JSON.parse(attempt);
+    } catch (_e) {
+      // try converting single quotes to double quotes (heuristic)
+      try {
+        const conv = singleQuotesToDouble(attempt);
+        const conv2 = removeTrailingCommas(conv);
+        return JSON.parse(conv2);
+      } catch (_e2) {
+        // continue to last resort
+      }
+    }
+  }
+
+  // 4. last resort: try to strip non-JSON prefix/suffix and extract the largest {...} or [...] substring
+  const objMatches = content.match(/\{[\s\S]*\}/);
+  if (objMatches) {
+    let attempt = objMatches[0];
+    attempt = removeTrailingCommas(attempt);
+    try {
+      return JSON.parse(attempt);
+    } catch (_e) {
+      try {
+        const conv = singleQuotesToDouble(attempt);
+        return JSON.parse(removeTrailingCommas(conv));
+      } catch (_e2) {
+        // give up
+      }
+    }
+  }
+
+  const arrMatches = content.match(/\[[\s\S]*\]/);
+  if (arrMatches) {
+    let attempt = arrMatches[0];
+    attempt = removeTrailingCommas(attempt);
+    try {
+      return JSON.parse(attempt);
+    } catch (_e) {
+      try {
+        const conv = singleQuotesToDouble(attempt);
+        return JSON.parse(removeTrailingCommas(conv));
+      } catch (_e2) {
+        // give up
+      }
+    }
+  }
+
+  // If all strategies fail, throw with original content for debugging
+  throw new Error("无法解析模型返回的 JSON（尝试多种修复均失败）。返回内容（前 2000 字）:\n" + content.slice(0, 2000));
+}
+
 export const generateLifeAnalysis = async (input: UserInput): Promise<LifeDestinyResult> => {
   // 强校验 API Key 是否存在
   if (!API_KEY) {
-    console.error("OpenAI API key 未设置。请在 Vite 环��变量中添加 VITE_OPENAI_KEY。");
+    console.error("OpenAI API key 未设置。请在 Vite 环境变量中添加 VITE_OPENAI_KEY。");
     throw new Error("OpenAI API key 未设置 (VITE_OPENAI_KEY)。请在 Vercel 环境变量或 .env.local 中配置。");
   }
 
@@ -59,14 +230,15 @@ export const generateLifeAnalysis = async (input: UserInput): Promise<LifeDestin
     ? "例如：第一步是【戊申】，第二步则是【己酉】（顺排）" 
     : "例如：第一步是【戊申】，第二步则是【丁未】（逆排）";
 
+  // Encourage model to return strict JSON only, wrapped in clear markers to help extraction.
   const userPrompt = `
     请根据以下**已经排好的**八字四柱和**指定的大运信息**进行分析。
-    
+
     【基本信息】
     性别：${genderStr}
     姓名：${input.name || "未提供"}
     出生年份：${input.birthYear}年 (阳历)
-    
+
     【八字四柱】
     年柱：${input.yearPillar}
     月柱：${input.monthPillar}
@@ -80,7 +252,17 @@ export const generateLifeAnalysis = async (input: UserInput): Promise<LifeDestin
 
     ${BAZI_SYSTEM_INSTRUCTION}
 
-    任务：请严格返回 JSON（不要在 JSON 外输出额外文本），字段需包含人生 K 线（1-100 岁）与 analysis（命理分项与评分）。
+    重要要求（请严格遵守）：
+    1) 返回内容必须是一个合法的 JSON 对象，不要在 JSON 之外输出任何解释性文本。
+    2) 为了便于程序抽取，请把 JSON 用下面的标记包裹（并只在这两个标记之间输出 JSON）：
+       ###JSON_START###
+       ```json
+       { ... }
+       ```
+       ###JSON_END###
+    3) JSON 中字段请严格按照 system instruction 中的结构返回（包含 chartData/chartPoints 与 analysis）。
+    4) 尽量不要使用单引号作为字符串边界；使用双引号。
+    5) 如果无法做到完全严格 JSON，请至少把 JSON 放在上面指定的标记内部。
   `;
 
   try {
@@ -96,7 +278,7 @@ export const generateLifeAnalysis = async (input: UserInput): Promise<LifeDestin
           { role: "system", content: BAZI_SYSTEM_INSTRUCTION },
           { role: "user", content: userPrompt }
         ],
-        temperature: 0.7,
+        temperature: 0.0, // reduce randomness to improve structured output
         max_tokens: 4000
       })
     });
@@ -113,21 +295,13 @@ export const generateLifeAnalysis = async (input: UserInput): Promise<LifeDestin
       throw new Error("模型未返回任何内容。");
     }
 
+    // Try safe parse with multiple heuristics/repairs
     let data: any;
     try {
-      data = JSON.parse(content);
+      data = safeParseModelJson(content);
     } catch (e: any) {
-      // 如果模型输出中有前置/后置文本，尝试从字符串中抽取最接近 JSON 的部分
-      const match = content.match(/(\{[\s\S]*\})/);
-      if (match) {
-        try {
-          data = JSON.parse(match[1]);
-        } catch (_e) {
-          throw new Error(`无法解析模型返回的 JSON（尝试抽取失败）: ${_e?.message || _e}`);
-        }
-      } else {
-        throw new Error(`无法解析模型返回的 JSON: ${e.message}`);
-      }
+      // include original content for debugging in the thrown error
+      throw new Error(`无法解析模型返回的 JSON（尝试抽取失败）: ${e.message}`);
     }
 
     if (!validateLifeDestinyData(data)) {
@@ -143,7 +317,6 @@ export const generateLifeAnalysis = async (input: UserInput): Promise<LifeDestin
     } as LifeDestinyResult;
   } catch (err: any) {
     console.error("generateLifeAnalysis 错误：", err);
-    // 把错误向上抛出以便 UI 展示
     throw new Error(err?.message || 'generateLifeAnalysis 发生未知错误');
   }
 };
