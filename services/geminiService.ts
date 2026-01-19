@@ -1,9 +1,16 @@
 import { UserInput, LifeDestinyResult, Gender } from "../types";
 import { BAZI_SYSTEM_INSTRUCTION } from "../constants";
 
-// TODO: 请将您的 OpenAI 格式密钥填入此处
-const API_KEY = "sk-UnpzkQCEqt3xRSs0FjzxkYKt8SULkjHTGviSoXsHtm0YHtTx"; 
-const API_BASE_URL = "https://max.openai365.top/v1";
+/**
+ * 注意：
+ * - 本实现从 Vite 的环境变量读取 API Key（VITE_OPENAI_KEY），并直接在浏览器端调用 OpenAI。
+ * - 这会把 key 打包到客户端，存在泄露风险。生产环境强烈建议使用后端中转（Vercel Serverless / API 路由）来保存与使用秘钥。
+ */
+
+// Vite 注入的环境变量（若未设置则为空字符串）
+const API_KEY = (import.meta.env.VITE_OPENAI_KEY as string) || "";
+const API_BASE_URL = (import.meta.env.VITE_OPENAI_BASE as string) || "https://api.openai.com/v1";
+const MODEL = (import.meta.env.VITE_OPENAI_MODEL as string) || "gpt-5";
 
 // Helper to determine stem polarity
 const getStemPolarity = (pillar: string): 'YANG' | 'YIN' => {
@@ -17,11 +24,21 @@ const getStemPolarity = (pillar: string): 'YANG' | 'YIN' => {
   return 'YANG'; // fallback
 };
 
+const validateLifeDestinyData = (data: any): boolean => {
+  if (!data) return false;
+  const chart = data.chartPoints || data.chartData;
+  const analysis = data.analysis;
+  if (!Array.isArray(chart)) return false;
+  if (!analysis || typeof analysis !== 'object') return false;
+  if (!Array.isArray(analysis.bazi)) return false;
+  return true;
+};
+
 export const generateLifeAnalysis = async (input: UserInput): Promise<LifeDestinyResult> => {
-  
-  // 简单检查 Key 是否已替换
-  if (!API_KEY || API_KEY.includes("YOUR_API_KEY_HERE")) {
-    console.warn("警告: API Key 尚未设置，请在 services/geminiService.ts 中填入密钥。");
+  // 强校验 API Key 是否存在
+  if (!API_KEY) {
+    console.error("OpenAI API key 未设置。请在 Vite 环��变量中添加 VITE_OPENAI_KEY。");
+    throw new Error("OpenAI API key 未设置 (VITE_OPENAI_KEY)。请在 Vercel 环境变量或 .env.local 中配置。");
   }
 
   const genderStr = input.gender === Gender.MALE ? '男 (乾造)' : '女 (坤造)';
@@ -38,7 +55,6 @@ export const generateLifeAnalysis = async (input: UserInput): Promise<LifeDestin
   }
 
   const daYunDirectionStr = isForward ? '顺行 (Forward)' : '逆行 (Backward)';
-  
   const directionExample = isForward 
     ? "例如：第一步是【戊申】，第二步则是【己酉】（顺排）" 
     : "例如：第一步是【戊申】，第二步则是【丁未】（逆排）";
@@ -52,100 +68,82 @@ export const generateLifeAnalysis = async (input: UserInput): Promise<LifeDestin
     出生年份：${input.birthYear}年 (阳历)
     
     【八字四柱】
-    年柱：${input.yearPillar} (天干属性：${yearStemPolarity === 'YANG' ? '阳' : '阴'})
+    年柱：${input.yearPillar}
     月柱：${input.monthPillar}
     日柱：${input.dayPillar}
     时柱：${input.hourPillar}
-    
-    【大运核心参数】
-    1. 起运年龄：${input.startAge} 岁 (虚岁)。
-    2. 第一步大运：${input.firstDaYun}。
-    3. **排序方向**：${daYunDirectionStr}。
-    
-    【必须执行的算法 - 大运序列生成】
-    请严格按照以下步骤生成数据：
-    
-    1. **锁定第一步**：确认【${input.firstDaYun}】为第一步大运。
-    2. **计算序列**：根据六十甲子顺序和方向（${daYunDirectionStr}），推算出接下来的 9 步大运。
-       ${directionExample}
-    3. **填充 JSON**：
-       - Age 1 到 ${startAgeInt - 1}: daYun = "童限"
-       - Age ${startAgeInt} 到 ${startAgeInt + 9}: daYun = [第1步大运: ${input.firstDaYun}]
-       - Age ${startAgeInt + 10} 到 ${startAgeInt + 19}: daYun = [第2步大运]
-       - Age ${startAgeInt + 20} 到 ${startAgeInt + 29}: daYun = [第3步大运]
-       - ...以此类推直到 100 岁。
-    
-    【特别警告】
-    - **daYun 字段**：必须填大运干支（10年一变），**绝对不要**填流年干支。
-    - **ganZhi 字段**：填入该年份的**流年干支**（每年一变，例如 2024=甲辰，2025=乙巳）。
-    
-    任务：
-    1. 确认格局与喜忌。
-    2. 生成 **1-100 岁 (虚岁)** 的人生流年K线数据。
-    3. 在 \`reason\` 字段中提供流年详批。
-    4. 生成带评分的命理分析报告。
-    
-    请严格按照系统指令生成 JSON 数据。
+
+    【起运与大运】
+    起运年龄（虚岁）：${input.startAge}
+    第一步大运：${input.firstDaYun}
+    大运方向：${daYunDirectionStr}，${directionExample}
+
+    ${BAZI_SYSTEM_INSTRUCTION}
+
+    任务：请严格返回 JSON（不要在 JSON 外输出额外文本），字段需包含人生 K 线（1-100 岁）与 analysis（命理分项与评分）。
   `;
 
   try {
-    const response = await fetch(`${API_BASE_URL}/chat/completions`, {
+    const res = await fetch(`${API_BASE_URL}/chat/completions`, {
       method: 'POST',
       headers: {
         'Content-Type': 'application/json',
         'Authorization': `Bearer ${API_KEY}`
       },
       body: JSON.stringify({
-        model: "[备用渠道A] gemini-3-pro-preview", // 
+        model: MODEL,
         messages: [
           { role: "system", content: BAZI_SYSTEM_INSTRUCTION },
           { role: "user", content: userPrompt }
         ],
-        response_format: { type: "json_object" },
-        temperature: 0.7
+        temperature: 0.7,
+        max_tokens: 4000
       })
     });
 
-    if (!response.ok) {
-      const errText = await response.text();
-      throw new Error(`API 请求失败: ${response.status} - ${errText}`);
+    if (!res.ok) {
+      const errText = await res.text();
+      throw new Error(`API 请求失败: ${res.status} - ${errText}`);
     }
 
-    const jsonResult = await response.json();
+    const jsonResult = await res.json();
     const content = jsonResult.choices?.[0]?.message?.content;
 
     if (!content) {
       throw new Error("模型未返回任何内容。");
     }
 
-    // 解析 JSON
-    const data = JSON.parse(content);
-
-    // 简单校验数据完整性
-    if (!data.chartPoints || !Array.isArray(data.chartPoints)) {
-      throw new Error("模型返回的数据格式不正确（缺失 chartPoints）。");
+    let data: any;
+    try {
+      data = JSON.parse(content);
+    } catch (e: any) {
+      // 如果模型输出中有前置/后置文本，尝试从字符串中抽取最接近 JSON 的部分
+      const match = content.match(/(\{[\s\S]*\})/);
+      if (match) {
+        try {
+          data = JSON.parse(match[1]);
+        } catch (_e) {
+          throw new Error(`无法解析模型返回的 JSON（尝试抽取失败）: ${_e?.message || _e}`);
+        }
+      } else {
+        throw new Error(`无法解析模型返回的 JSON: ${e.message}`);
+      }
     }
 
+    if (!validateLifeDestinyData(data)) {
+      throw new Error("模型返回的数据不完整或格式不正确。请检查 prompt 或模型输出格式。");
+    }
+
+    const chartData = data.chartPoints || data.chartData;
+    const analysis = data.analysis;
+
     return {
-      chartData: data.chartPoints,
-      analysis: {
-        bazi: data.bazi || [],
-        summary: data.summary || "无摘要",
-        summaryScore: data.summaryScore || 5,
-        industry: data.industry || "无",
-        industryScore: data.industryScore || 5,
-        wealth: data.wealth || "无",
-        wealthScore: data.wealthScore || 5,
-        marriage: data.marriage || "无",
-        marriageScore: data.marriageScore || 5,
-        health: data.health || "无",
-        healthScore: data.healthScore || 5,
-        family: data.family || "无",
-        familyScore: data.familyScore || 5,
-      },
-    };
-  } catch (error) {
-    console.error("Gemini/OpenAI API Error:", error);
-    throw error;
+      chartData,
+      analysis
+    } as LifeDestinyResult;
+  } catch (err: any) {
+    console.error("generateLifeAnalysis 错误：", err);
+    // 把错误向上抛出以便 UI 展示
+    throw new Error(err?.message || 'generateLifeAnalysis 发生未知错误');
   }
 };
